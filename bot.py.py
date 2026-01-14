@@ -2,7 +2,8 @@ import os
 import io
 import imghdr
 import logging
-from typing import List, Optional
+import asyncio
+from typing import List, Optional, Dict
 
 from PIL import Image
 
@@ -19,21 +20,37 @@ from telegram.ext import (
 from google import genai
 from google.genai import types
 
+
+# ----------------- Config -----------------
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("img-edit-bot")
 
-TELEGRAM_BOT_TOKEN = os.environ["8160763500:AAGQhWZcxaHEEPTfjCF5jlRQDlLb0CYS91U"]
-
-# Gemini native image generation/edit model
 MODEL = "gemini-2.5-flash-image"
-
-client = genai.Client()  # GEMINI_API_KEY env var থেকে নেবে
-
-
 MAX_IMAGES = 3
 MAX_SIDE = 1536  # বড় ছবি হলে resize করে পাঠাবো (speed + reliability)
 
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
+if not TELEGRAM_BOT_TOKEN:
+    raise RuntimeError("Missing TELEGRAM_BOT_TOKEN env var")
+
+if not GEMINI_API_KEY:
+    raise RuntimeError("Missing GEMINI_API_KEY env var")
+
+client = genai.Client(api_key=GEMINI_API_KEY)
+
+# per-user generation lock (avoid overlapping runs)
+USER_LOCKS: Dict[int, asyncio.Lock] = {}
+
+
+def _get_lock(user_id: int) -> asyncio.Lock:
+    if user_id not in USER_LOCKS:
+        USER_LOCKS[user_id] = asyncio.Lock()
+    return USER_LOCKS[user_id]
+
+
+# ----------------- Helpers -----------------
 def _guess_mime(b: bytes) -> str:
     k = imghdr.what(None, h=b)
     if k == "png":
@@ -53,6 +70,7 @@ def _downscale_image_bytes(image_bytes: bytes) -> bytes:
         m = max(w, h)
         if m <= MAX_SIDE:
             return image_bytes
+
         scale = MAX_SIDE / float(m)
         new_w, new_h = int(w * scale), int(h * scale)
         img = img.resize((new_w, new_h), Image.LANCZOS)
@@ -65,19 +83,74 @@ def _downscale_image_bytes(image_bytes: bytes) -> bytes:
 
 
 def _get_state(context: ContextTypes.DEFAULT_TYPE):
-    if "images" not in context.user_data:
-        context.user_data["images"] = []
-    if "prompt" not in context.user_data:
-        context.user_data["prompt"] = None
+    """
+    context.user_data:
+      images: List[bytes]
+      prompt: Optional[str]
+    """
+    context.user_data.setdefault("images", [])
+    context.user_data.setdefault("prompt", None)
     return context.user_data["images"], context.user_data["prompt"]
 
 
+async def _download_image_bytes(update: Update) -> Optional[bytes]:
+    msg = update.effective_message
+    if not msg:
+        return None
+
+    # PHOTO
+    if msg.photo:
+        best = msg.photo[-1]  # best resolution usually last
+        tg_file = await best.get_file()
+        return bytes(await tg_file.download_as_bytearray())
+
+    # Image document (send as file)
+    if msg.document and (msg.document.mime_type or "").startswith("image/"):
+        tg_file = await msg.document.get_file()
+        return bytes(await tg_file.download_as_bytearray())
+
+    return None
+
+
+async def _generate_edited_image(prompt: str, image_bytes_list: List[bytes]) -> bytes:
+    parts = []
+    for b in image_bytes_list:
+        parts.append(types.Part.from_bytes(data=b, mime_type=_guess_mime(b)))
+
+    if not image_bytes_list:
+        raise RuntimeError("No images uploaded. Please send at least 1 image.")
+
+    instruction = (
+        "Edit the FIRST provided image as the base. "
+        "If more images are provided, use them only as reference. "
+        "Preserve the original style unless asked.\n"
+        f"Instruction: {prompt}\n"
+        "Return only the edited image."
+    )
+
+    resp = await client.aio.models.generate_content(
+        model=MODEL,
+        contents=parts + [instruction],
+        config=types.GenerateContentConfig(response_modalities=["IMAGE"]),
+    )
+
+    for part in getattr(resp, "parts", []) or []:
+        if part.inline_data is not None:
+            pil_img = part.as_image()
+            out = io.BytesIO()
+            pil_img.save(out, format="PNG")
+            return out.getvalue()
+
+    raise RuntimeError("No image returned (blocked/empty output). Try another prompt or image.")
+
+
+# ----------------- Telegram Handlers -----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "✅ Image Edit Bot\n\n"
         "কাজ:\n"
-        "1) 1-3টা ছবি পাঠান\n"
-        "2) তারপর একটা prompt লিখুন (যেমন: “make her touching her hair”)\n\n"
+        f"1) 1-{MAX_IMAGES}টা ছবি পাঠান\n"
+        "2) তারপর একটা prompt লিখুন (যেমন: make her touching her hair)\n\n"
         "Commands:\n"
         "/status - কত ছবি আপলোড হয়েছে দেখাবে\n"
         "/clear - সব reset করবে"
@@ -98,29 +171,8 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def _download_image_bytes(update: Update) -> Optional[bytes]:
-    msg = update.effective_message
-    if not msg:
-        return None
-
-    # PHOTO
-    if msg.photo:
-        best = msg.photo[-1]  # best resolution usually last
-        tg_file = await best.get_file()
-        b = bytes(await tg_file.download_as_bytearray())
-        return b
-
-    # Image document (send as file)
-    if msg.document and (msg.document.mime_type or "").startswith("image/"):
-        tg_file = await msg.document.get_file()
-        b = bytes(await tg_file.download_as_bytearray())
-        return b
-
-    return None
-
-
 async def on_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    images, _prompt = _get_state(context)
+    images, _ = _get_state(context)
 
     if len(images) >= MAX_IMAGES:
         await update.message.reply_text(
@@ -138,47 +190,8 @@ async def on_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     idx = len(images)
     await update.message.reply_text(
-        f"Image {idx} received. Please send a text prompt to describe the changes."
+        f"Image {idx} received ✅\nNow send a text prompt to describe the changes."
     )
-
-
-async def _generate_edited_image(prompt: str, image_bytes_list: List[bytes]) -> bytes:
-    parts = []
-    for b in image_bytes_list:
-        mime = _guess_mime(b)
-        parts.append(types.Part.from_bytes(data=b, mime_type=mime))
-
-    # Model-কে পরিষ্কার নির্দেশনা
-    if image_bytes_list:
-        instruction = (
-            "Edit the FIRST provided image as the base. "
-            "If more images are provided, use them only as reference. "
-            "Keep the person identity consistent and preserve the original style unless asked.\n"
-            f"Instruction: {prompt}\n"
-            "Return only the edited image."
-        )
-    else:
-        instruction = prompt
-
-    config = types.GenerateContentConfig(
-        response_modalities=["IMAGE"]
-    )
-
-    resp = await client.aio.models.generate_content(
-        model=MODEL,
-        contents=parts + [instruction] if parts else [instruction],
-        config=config,
-    )
-
-    # Output image extract
-    for part in getattr(resp, "parts", []) or []:
-        if part.inline_data is not None:
-            pil_img = part.as_image()
-            out = io.BytesIO()
-            pil_img.save(out, format="PNG")
-            return out.getvalue()
-
-    raise RuntimeError("No image returned by model (blocked/empty output).")
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -190,37 +203,48 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text or text.startswith("/"):
         return
 
-    images, _prompt = _get_state(context)
-    context.user_data["prompt"] = text
+    user_id = update.effective_user.id
+    lock = _get_lock(user_id)
 
-    # UX like the video
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-    progress_msg = await msg.reply_text("Your request is progressing...")
+    images, _ = _get_state(context)
+    if len(images) == 0:
+        await msg.reply_text("আগে অন্তত 1টা ছবি পাঠান 🙂 তারপর prompt দিন।")
+        return
 
-    try:
-        out_png = await _generate_edited_image(text, images)
+    # prevent overlapping generations
+    if lock.locked():
+        await msg.reply_text("⏳ Already processing… একটু অপেক্ষা করুন বা /clear দিন।")
+        return
 
-        bio = io.BytesIO(out_png)
-        bio.name = "result.png"
-        bio.seek(0)
+    async with lock:
+        context.user_data["prompt"] = text
 
-        caption = f'Generated based on your prompt: "{text}"'
-        await msg.reply_photo(photo=bio, caption=caption)
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+        progress_msg = await msg.reply_text("Your request is progressing...")
 
-        # reset project (video-style)
-        context.user_data["images"] = []
-        context.user_data["prompt"] = None
-        await msg.reply_text("Process finished. You can start a new project by sending images.")
-
-    except Exception as e:
-        log.exception("Generation failed")
-        await msg.reply_text(f"❌ Failed: {e}\nTip: /clear করে আবার চেষ্টা করুন।")
-
-    finally:
         try:
-            await progress_msg.delete()
-        except Exception:
-            pass
+            out_png = await _generate_edited_image(text, images)
+
+            bio = io.BytesIO(out_png)
+            bio.name = "result.png"
+            bio.seek(0)
+
+            await msg.reply_photo(photo=bio, caption=f'✅ Generated: "{text}"')
+
+            # reset project (video-style)
+            context.user_data["images"] = []
+            context.user_data["prompt"] = None
+            await msg.reply_text("Process finished ✅\nSend new images to start again.")
+
+        except Exception as e:
+            log.exception("Generation failed")
+            await msg.reply_text(f"❌ Failed: {e}\nTip: /clear করে আবার চেষ্টা করুন।")
+
+        finally:
+            try:
+                await progress_msg.delete()
+            except Exception:
+                pass
 
 
 async def on_other(update: Update, context: ContextTypes.DEFAULT_TYPE):
